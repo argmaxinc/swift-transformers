@@ -6,6 +6,8 @@
 //
 
 import Foundation
+import CryptoKit
+import os
 
 public struct HubApi {
     var downloadBase: URL
@@ -29,6 +31,8 @@ public struct HubApi {
     }
     
     public static let shared = HubApi()
+    
+    private static let logger = Logger()
 }
 
 private extension HubApi {
@@ -98,11 +102,15 @@ public extension HubApi {
             request.setValue("Bearer \(hfToken)", forHTTPHeaderField: "Authorization")
         }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        let redirectDelegate = RedirectDelegate()
+        let session = URLSession(configuration: .default, delegate: redirectDelegate, delegateQueue: nil)
+        
+        let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw Hub.HubClientError.unexpectedError }
 
         switch response.statusCode {
-        case 200..<300: break
+        case 200..<400: break
         case 400..<500: throw Hub.HubClientError.authorizationRequired
         default: throw Hub.HubClientError.httpStatusCode(response.statusCode)
         }
@@ -135,6 +143,26 @@ public extension HubApi {
     
     func getFilenames(from repoId: String, matching glob: String) async throws -> [String] {
         return try await getFilenames(from: Repo(id: repoId), matching: [glob])
+    }
+}
+
+/// Additional Errors
+public extension HubApi {
+    enum EnvironmentError: LocalizedError {
+        case consistencyError(String)
+        case diskSpaceError(String)
+        case permissionError(String)
+        case invalidMetadataError(String)
+        
+        public var errorDescription: String? {
+            switch self {
+            case .consistencyError(let message),
+                 .diskSpaceError(let message),
+                 .permissionError(let message),
+                 .invalidMetadataError(let message):
+                return message
+            }
+        }
     }
 }
 
@@ -201,6 +229,12 @@ public extension HubApi {
             repoDestination.appending(path: relativeFilename)
         }
         
+        var metadataDestination: URL {
+            repoDestination
+                .appendingPathComponent(".cache")
+                .appendingPathComponent("huggingface")
+        }
+        
         var downloaded: Bool {
             FileManager.default.fileExists(atPath: destination.path)
         }
@@ -209,16 +243,142 @@ public extension HubApi {
             let directoryURL = destination.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
         }
-
+        
+        func prepareMetadataDestination() throws {
+            try FileManager.default.createDirectory(at: metadataDestination, withIntermediateDirectories: true, attributes: nil)
+        }
+        
+        func readDownloadMetadata(localDir: URL, filePath: String) throws -> FileMetadata? {
+            let metadataPath = localDir.appending(path: filePath)
+            if FileManager.default.fileExists(atPath: metadataPath.path) {
+                let contents = try String(contentsOf: metadataPath, encoding: .utf8)
+                let lines = contents.components(separatedBy: .newlines)
+                
+                guard lines.count == 4 else {
+                    do {
+                        logger.warning("Invalid metadata file \(metadataPath). Removing it from disk and continue.")
+                        try FileManager.default.removeItem(at: metadataPath)
+                    } catch {
+                        throw EnvironmentError.invalidMetadataError("Could not remove corrupted metadata file \(metadataPath): \(error)")
+                    }
+                    return nil
+                }
+                
+                let commitHash = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                let etag = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                return FileMetadata(commitHash: commitHash, etag: etag, location: "", size: nil)
+            }
+            
+            logger.warning("Metadata file \(metadataPath) does not exist.")
+            return nil
+        }
+        
+        func isValidSHA256(_ hash: String) -> Bool {
+            let sha256Pattern = "^[0-9a-f]{64}$"
+            let regex = try? NSRegularExpression(pattern: sha256Pattern)
+            let range = NSRange(location: 0, length: hash.utf16.count)
+            return regex?.firstMatch(in: hash, options: [], range: range) != nil
+        }
+        
+        func writeDownloadMetadata(commitHash: String, etag: String, metadataRelativePath: String) throws {
+            let metadataContent = "\(commitHash)\n\(etag)\n\(Date().timeIntervalSince1970)\n"
+            let metadataPath = metadataDestination.appending(component: metadataRelativePath)
+            
+            do {
+                try FileManager.default.createDirectory(at: metadataPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try metadataContent.write(to: metadataPath, atomically: true, encoding: .utf8)
+            } catch {
+                throw EnvironmentError.invalidMetadataError("Failed to write metadata file \(metadataPath)")
+            }
+        }
+        
+        func computeFileHash(file url: URL) throws -> String {
+            // Open file for reading
+            guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
+                throw Hub.HubClientError.unexpectedError
+            }
+            
+            defer {
+                try? fileHandle.close()
+            }
+            
+            var hasher = SHA256()
+            let chunkSize = 1024 * 1024 // 1MB chunks
+            
+            while true {
+                let data: Data
+                if #available(macOS 10.15.4, iOS 13.4, *) {
+                    data = try fileHandle.read(upToCount: chunkSize) ?? Data()
+                } else {
+                    data = fileHandle.readData(ofLength: chunkSize)
+                }
+                
+                if data.isEmpty {
+                    break
+                }
+                
+                hasher.update(data: data)
+            }
+            
+            let digest = hasher.finalize()
+            return digest.map { String(format: "%02x", $0) }.joined()
+        }
+        
+        
         // Note we go from Combine in Downloader to callback-based progress reporting
         // We'll probably need to support Combine as well to play well with Swift UI
         // (See for example PipelineLoader in swift-coreml-diffusers)
         @discardableResult
         func download(progressHandler: @escaping (Double) -> Void) async throws -> URL {
-            guard !downloaded else { return destination }
-
+            var metadataRelativePath = (relativeFilename as NSString).deletingPathExtension
+            metadataRelativePath += ".metadata"
+                        
+            let localMetadata = try readDownloadMetadata(localDir: metadataDestination, filePath: metadataRelativePath)
+            let remoteMetadata = try await HubApi.shared.getFileMetadata(url: source)
+            
+            let localCommitHash = localMetadata?.commitHash ?? ""
+            let remoteCommitHash = remoteMetadata.commitHash ?? ""
+            
+            // Local file exists + metadata exists + commit_hash matches => return file
+            if isValidSHA256(remoteCommitHash) && downloaded && localMetadata != nil && localCommitHash == remoteCommitHash {
+                return destination
+            }
+            
+            // From now on, etag, commit_hash, url and size are not empty
+            guard let remoteCommitHash = remoteMetadata.commitHash,
+                  let remoteEtag = remoteMetadata.etag,
+                  let remoteSize = remoteMetadata.size,
+                  remoteMetadata.location != "" else {
+                throw EnvironmentError.invalidMetadataError("File metadata must have been retrieved from server")
+            }
+            
+            // Local file exists => check if it's up-to-date
+            if downloaded {
+                // etag matches => update metadata and return file
+                if localMetadata?.etag == remoteEtag {
+                    try writeDownloadMetadata(commitHash: remoteCommitHash, etag: remoteEtag, metadataRelativePath: metadataRelativePath)
+                    return destination
+                }
+                
+                // metadata is outdated + etag is a sha256
+                // => means it's an LFS file (large)
+                // => let's compute local hash and compare
+                // => if match, update metadata and return file
+                if localMetadata != nil && isValidSHA256(remoteEtag) {
+                    let fileHash = try computeFileHash(file: destination)
+                    if fileHash == remoteEtag {
+                        try writeDownloadMetadata(commitHash: remoteCommitHash, etag: remoteEtag, metadataRelativePath: metadataRelativePath)
+                        return destination
+                    }
+                }
+            }
+            
+            // Otherwise, let's download the file!
             try prepareDestination()
-            let downloader = Downloader(from: source, to: destination, using: hfToken, inBackground: backgroundSession)
+            try prepareMetadataDestination()
+
+            let downloader = Downloader(from: source, to: destination, metadataDirURL: metadataDestination, using: hfToken, inBackground: backgroundSession, expectedSize: remoteSize)
             let downloadSubscriber = downloader.downloadState.sink { state in
                 if case .downloading(let progress) = state {
                     progressHandler(progress)
@@ -227,6 +387,9 @@ public extension HubApi {
             _ = try withExtendedLifetime(downloadSubscriber) {
                 try downloader.waitUntilDone()
             }
+            
+            try writeDownloadMetadata(commitHash: remoteCommitHash, etag: remoteEtag, metadataRelativePath: metadataRelativePath)
+            
             return destination
         }
     }
@@ -296,13 +459,14 @@ public extension HubApi {
     
     func getFileMetadata(url: URL) async throws -> FileMetadata {
         let (_, response) = try await httpHead(for: url)
+        let location = response.statusCode == 302 ? response.value(forHTTPHeaderField: "Location") : response.url?.absoluteString
         
         return FileMetadata(
             commitHash: response.value(forHTTPHeaderField: "X-Repo-Commit"),
             etag: normalizeEtag(
                 (response.value(forHTTPHeaderField: "X-Linked-Etag")) ?? (response.value(forHTTPHeaderField: "Etag"))
             ),
-            location: (response.value(forHTTPHeaderField: "Location")) ?? url.absoluteString,
+            location: location ?? url.absoluteString,
             size: Int(response.value(forHTTPHeaderField: "X-Linked-Size") ?? response.value(forHTTPHeaderField: "Content-Length") ?? "")
         )
     }
@@ -393,5 +557,44 @@ public extension Hub {
 public extension [String] {
     func matching(glob: String) -> [String] {
         filter { fnmatch(glob, $0, 0) == 0 }
+    }
+}
+
+// Only allow relative redirects and reject others
+private class RedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        // Check if it's a redirect status code (300-399)
+        if (300...399).contains(response.statusCode) {
+            // Get the Location header
+            if let locationString = response.value(forHTTPHeaderField: "Location"),
+               let locationUrl = URL(string: locationString) {
+                
+                // Check if it's a relative redirect (no host component)
+                if locationUrl.host == nil {
+                    // For relative redirects, construct the new URL using the original request's base
+                    if let originalUrl = task.originalRequest?.url,
+                       var components = URLComponents(url: originalUrl, resolvingAgainstBaseURL: true) {
+                        // Update the path component with the relative path
+                        components.path = locationUrl.path
+                        components.query = locationUrl.query
+                        
+                        // Create new request with the resolved URL
+                        if let resolvedUrl = components.url {
+                            var newRequest = URLRequest(url: resolvedUrl)
+                            // Copy headers from original request
+                            task.originalRequest?.allHTTPHeaderFields?.forEach { key, value in
+                                newRequest.setValue(value, forHTTPHeaderField: key)
+                            }
+                            newRequest.setValue(resolvedUrl.absoluteString, forHTTPHeaderField: "Location")
+                            completionHandler(newRequest)
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        
+        // For all other cases (non-redirects or absolute redirects), prevent redirect
+        completionHandler(nil)
     }
 }
