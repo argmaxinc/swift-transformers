@@ -56,6 +56,7 @@ private extension HubApi {
                     )
                 }
             },
+            { try? String(contentsOf: .homeDirectory.appendingPathComponent(".cache/huggingface/token"), encoding: .utf8) },
             { try? String(contentsOf: .homeDirectory.appendingPathComponent(".huggingface/token"), encoding: .utf8) }
         ]
         return possibleTokens
@@ -151,17 +152,11 @@ public extension HubApi {
 /// Additional Errors
 public extension HubApi {
     enum EnvironmentError: LocalizedError {
-        case consistencyError(String)
-        case diskSpaceError(String)
-        case permissionError(String)
         case invalidMetadataError(String)
         
         public var errorDescription: String? {
             switch self {
-            case .consistencyError(let message),
-                 .diskSpaceError(let message),
-                 .permissionError(let message),
-                 .invalidMetadataError(let message):
+            case .invalidMetadataError(let message):
                 return message
             }
         }
@@ -214,6 +209,9 @@ public extension HubApi {
         let hfToken: String?
         let endpoint: String?
         let backgroundSession: Bool
+        
+        let sha256Pattern = "^[0-9a-f]{64}$"
+        let commitHashPattern = "^[0-9a-f]{40}$"
 
         var source: URL {
             // https://huggingface.co/coreml-projects/Llama-2-7b-chat-coreml/resolve/main/tokenizer.json?download=true
@@ -235,6 +233,7 @@ public extension HubApi {
             repoDestination
                 .appendingPathComponent(".cache")
                 .appendingPathComponent("huggingface")
+                .appendingPathComponent("download")
         }
         
         var downloaded: Bool {
@@ -255,7 +254,7 @@ public extension HubApi {
         /// Reference: https://github.com/huggingface/huggingface_hub/blob/b2c9a148d465b43ab90fab6e4ebcbbf5a9df27d4/src/huggingface_hub/_local_folder.py#L263
         ///
         /// - Parameters:
-        ///   - localDir: The local directory where files are downloaded.
+        ///   - localDir: The local directory where metadata files are downloaded.
         ///   - filePath: The path of the file for which metadata is being read.
         /// - Throws: An `EnvironmentError.invalidMetadataError` if the metadata file is invalid and cannot be removed.
         /// - Returns: A `LocalDownloadFileMetadata` object if the metadata file exists and is valid, or `nil` if the file is missing or invalid.
@@ -278,6 +277,7 @@ public extension HubApi {
                     let timestampDate = Date(timeIntervalSince1970: timestamp)
                             
                     // TODO: check if file hasn't been modified since the metadata was saved
+                    // Reference: https://github.com/huggingface/huggingface_hub/blob/2fdc6f48ef5e6b22ee9bcdc1945948ac070da675/src/huggingface_hub/_local_folder.py#L303
                     
                     return LocalDownloadFileMetadata(commitHash: commitHash, etag: etag, filename: filePath, timestamp: timestampDate)
                 } catch {
@@ -295,9 +295,8 @@ public extension HubApi {
             return nil
         }
         
-        func isValidSHA256(_ hash: String) -> Bool {
-            let sha256Pattern = "^[0-9a-f]{64}$"
-            let regex = try? NSRegularExpression(pattern: sha256Pattern)
+        func isValidHash(hash: String, pattern: String) -> Bool {
+            let regex = try? NSRegularExpression(pattern: pattern)
             let range = NSRange(location: 0, length: hash.utf16.count)
             return regex?.firstMatch(in: hash, options: [], range: range) != nil
         }
@@ -352,8 +351,7 @@ public extension HubApi {
         // (See for example PipelineLoader in swift-coreml-diffusers)
         @discardableResult
         func download(progressHandler: @escaping (Double) -> Void) async throws -> URL {
-            var metadataRelativePath = (relativeFilename as NSString).deletingPathExtension
-            metadataRelativePath += ".metadata"
+            let metadataRelativePath = "\(relativeFilename).metadata"
                         
             let localMetadata = try readDownloadMetadata(localDir: metadataDestination, filePath: metadataRelativePath)
             let remoteMetadata = try await HubApi.shared.getFileMetadata(url: source)
@@ -362,7 +360,7 @@ public extension HubApi {
             let remoteCommitHash = remoteMetadata.commitHash ?? ""
             
             // Local file exists + metadata exists + commit_hash matches => return file
-            if isValidSHA256(remoteCommitHash) && downloaded && localMetadata != nil && localCommitHash == remoteCommitHash {
+            if isValidHash(hash: remoteCommitHash, pattern: commitHashPattern) && downloaded && localMetadata != nil && localCommitHash == remoteCommitHash {
                 return destination
             }
             
@@ -382,11 +380,11 @@ public extension HubApi {
                     return destination
                 }
                 
-                // metadata is outdated + etag is a sha256
+                // etag is a sha256
                 // => means it's an LFS file (large)
                 // => let's compute local hash and compare
                 // => if match, update metadata and return file
-                if localMetadata != nil && isValidSHA256(remoteEtag) {
+                if isValidHash(hash: remoteEtag, pattern: sha256Pattern) {
                     let fileHash = try computeFileHash(file: destination)
                     if fileHash == remoteEtag {
                         try writeDownloadMetadata(commitHash: remoteCommitHash, etag: remoteEtag, metadataRelativePath: metadataRelativePath)
